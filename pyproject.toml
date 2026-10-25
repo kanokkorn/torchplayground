@@ -1,7 +1,81 @@
 [project]
 name = "torchplayground"
 version = "0.1.0"
-description = "Add your description here"
+description = "Pytorch playground"
 readme = "README"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+  "numpy>=2.0.0",
+]
+
+# [build-system]
+# requires = ["hatchling"]
+# build-backend = "hatchling.build"
+
+[project.optional-dependencies]
+cpu = [
+  "torch>=2.11.0",
+  "torchvision>=0.26.0",
+]
+
+cuda = [
+  "torch>=2.11.0",
+  "torchvision>=0.26.0",
+]
+
+rocm = [
+  "torch>=2.11.0",
+  "torchvision>=0.26.0",
+  "pytorch-triton-rocm>=3.5.1 ; sys_platform == 'linux'",
+  "triton-rocm>=3.6.0 ; sys_platform == 'linux'",
+]
+
+
+# Only one backend at a time.
+[tool.uv]
+conflicts = [
+  [
+    { extra = "cpu" },
+    { extra = "cuda" },
+    { extra = "rocm" },
+  ],
+]
+
+
+[tool.uv.sources]
+torch = [
+{ index = "pytorch-cpu", extra = "cpu" },
+  { index = "pytorch-cu130", extra = "cuda", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+  { index = "pytorch-rocm", extra = "rocm", marker = "sys_platform == 'linux'" },
+]
+
+torchvision = [
+  { index = "pytorch-cpu", extra = "cpu" },
+  { index = "pytorch-cu130", extra = "cuda", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+  { index = "pytorch-rocm", extra = "rocm", marker = "sys_platform == 'linux'" },
+]
+
+pytorch-triton-rocm = [
+  { index = "pytorch-rocm", extra = "rocm", marker = "sys_platform == 'linux'" },
+]
+
+triton-rocm = [
+  { index = "pytorch-rocm", extra = "rocm", marker = "sys_platform == 'linux'" },
+]
+
+# explicit = true keeps jinja2 / numpy / etc. on PyPI.
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-rocm"
+url = "https://download.pytorch.org/whl/rocm7.2"
+explicit = true
