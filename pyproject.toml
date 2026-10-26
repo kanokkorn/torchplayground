@@ -45,13 +45,13 @@ conflicts = [
 [tool.uv.sources]
 torch = [
 { index = "pytorch-cpu", extra = "cpu" },
-  { index = "pytorch-cu130", extra = "cuda", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+  { index = "pytorch-cu126", extra = "cuda", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
   { index = "pytorch-rocm", extra = "rocm", marker = "sys_platform == 'linux'" },
 ]
 
 torchvision = [
   { index = "pytorch-cpu", extra = "cpu" },
-  { index = "pytorch-cu130", extra = "cuda", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+  { index = "pytorch-cu126", extra = "cuda", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
   { index = "pytorch-rocm", extra = "rocm", marker = "sys_platform == 'linux'" },
 ]
 
@@ -71,8 +71,8 @@ url = "https://download.pytorch.org/whl/cpu"
 explicit = true
 
 [[tool.uv.index]]
-name = "pytorch-cu130"
-url = "https://download.pytorch.org/whl/cu130"
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
 explicit = true
 
 [[tool.uv.index]]
