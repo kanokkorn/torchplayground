@@ -1,12 +1,10 @@
-#!/usr/bin/env python3
 """PyTorch device probe + light benchmark.
 
 Usage:
   python pytorch_bench.py
-  python pytorch_bench.py --bench matmul
-  python pytorch_bench.py --bench train,infer --device cuda
-  python pytorch_bench.py --device auto --json results.json
-  python pytorch_bench.py --size 4096 --dtype float16
+  python pytorch_bench.py --bench bandwidth,compile,export
+  python pytorch_bench.py --device cuda --compile-mode default,reduce-overhead
+  python pytorch_bench.py --sequential --dtype float16 --json
 """
 
 from __future__ import annotations
@@ -17,23 +15,26 @@ import os
 import platform
 import subprocess
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager, nullcontext
 from typing import Any, Callable
+
+try:
+    import torch
+    import torch.nn as nn
+except ImportError:
+    sys.stderr.write("PyTorch is not installed. Try: pip install torch\n")
+    sys.exit(1)
+
 
 # ---------------------------------------------------------------------------
 # ANSI color (no extra deps)
 # ---------------------------------------------------------------------------
 
 class Color:
-    off = ""
-    reset = ""
-    bold = ""
-    dim = ""
-    red = ""
-    green = ""
-    yellow = ""
-    cyan = ""
-    magenta = ""
+    reset = bold = dim = red = green = yellow = cyan = magenta = ""
 
     @classmethod
     def enable(cls, on: bool) -> None:
@@ -51,9 +52,7 @@ class Color:
 
 def c(style: str, text: str) -> str:
     s = getattr(Color, style, "")
-    if not s:
-        return text
-    return f"{s}{text}{Color.reset}"
+    return f"{s}{text}{Color.reset}" if s else text
 
 
 def enable_windows_ansi() -> None:
@@ -71,8 +70,17 @@ def enable_windows_ansi() -> None:
         pass
 
 
+PRINT_LOCK = threading.Lock()
+COMPILE_LOCK = threading.Lock()  # dynamo/inductor is not happy compiling on two threads
+
+
+def log(msg: str = "") -> None:
+    with PRINT_LOCK:
+        print(msg, flush=True)
+
+
 # ---------------------------------------------------------------------------
-# System info (stdlib only)
+# System info
 # ---------------------------------------------------------------------------
 
 def fmt_bytes(n: int | None) -> str:
@@ -99,11 +107,7 @@ def cpu_name() -> str:
                 ["sysctl", "-n", "machdep.cpu.brand_string"], text=True
             ).strip()
         elif system == "Windows":
-            return (
-                platform.processor()
-                or os.environ.get("PROCESSOR_IDENTIFIER")
-                or "Unknown CPU"
-            )
+            return platform.processor() or os.environ.get("PROCESSOR_IDENTIFIER") or "Unknown CPU"
     except Exception:
         pass
     return platform.processor() or "Unknown CPU"
@@ -118,8 +122,7 @@ def ram_bytes() -> int | None:
                     if line.startswith("MemTotal:"):
                         return int(line.split()[1]) * 1024
         elif system == "Darwin":
-            out = subprocess.check_output(["sysctl", "-n", "hw.memsize"], text=True)
-            return int(out.strip())
+            return int(subprocess.check_output(["sysctl", "-n", "hw.memsize"], text=True).strip())
         elif system == "Windows":
             import ctypes
 
@@ -146,16 +149,8 @@ def ram_bytes() -> int | None:
 
 
 # ---------------------------------------------------------------------------
-# PyTorch import + devices
+# Devices
 # ---------------------------------------------------------------------------
-
-try:
-    import torch
-    import torch.nn as nn
-except ImportError:
-    sys.stderr.write("PyTorch is not installed. Try: pip install torch\n")
-    sys.exit(1)
-
 
 def sync(device: torch.device) -> None:
     if device.type == "cuda":
@@ -199,7 +194,7 @@ def device_vram(device: torch.device) -> int | None:
         except Exception:
             return None
     if device.type == "mps":
-        return ram_bytes()  # unified
+        return ram_bytes()
     return None
 
 
@@ -213,26 +208,19 @@ def extra_device_info(device: torch.device) -> dict[str, Any]:
 
 
 def discover_devices() -> list[torch.device]:
-    """Accelerators first (CUDA/ROCm, MPS, XPU), CPU last."""
     found: list[torch.device] = []
-
     if torch.cuda.is_available():
         for i in range(torch.cuda.device_count()):
             found.append(torch.device(f"cuda:{i}"))
-
-    mps_ok = bool(getattr(torch.backends, "mps", None)) and torch.backends.mps.is_available()
-    if mps_ok:
+    if bool(getattr(torch.backends, "mps", None)) and torch.backends.mps.is_available():
         found.append(torch.device("mps"))
-
     if hasattr(torch, "xpu"):
         try:
             if torch.xpu.is_available():
-                n = torch.xpu.device_count()
-                for i in range(n):
+                for i in range(torch.xpu.device_count()):
                     found.append(torch.device(f"xpu:{i}"))
         except Exception:
             pass
-
     found.append(torch.device("cpu"))
     return found
 
@@ -256,7 +244,7 @@ def filter_devices(all_devs: list[torch.device], spec: str) -> list[torch.device
             wanted.append(d)
         elif spec == "cpu" and d.type == "cpu":
             wanted.append(d)
-        elif spec == key or spec == f"{d.type}:{d.index}":
+        elif spec in (key, f"{d.type}:{d.index}"):
             wanted.append(d)
     return wanted
 
@@ -277,6 +265,23 @@ def backend_label() -> str:
     return "CPU"
 
 
+@contextmanager
+def on_device(device: torch.device):
+    if device.type == "cuda":
+        with torch.cuda.device(device):
+            stream = torch.cuda.Stream(device=device)
+            with torch.cuda.stream(stream):
+                yield
+                stream.synchronize()
+        return
+    if device.type == "xpu" and hasattr(torch, "xpu"):
+        cm = torch.xpu.device(device) if hasattr(torch.xpu, "device") else nullcontext()
+        with cm:
+            yield
+        return
+    yield
+
+
 # ---------------------------------------------------------------------------
 # Timing
 # ---------------------------------------------------------------------------
@@ -292,20 +297,31 @@ def timed_runs(
         sync(device)
 
     times: list[float] = []
-    for _ in range(runs):
-        sync(device)
-        t0 = time.perf_counter()
-        fn()
-        sync(device)
-        times.append(time.perf_counter() - t0)
-
+    if device.type == "cuda":
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        for _ in range(runs):
+            start.record()
+            fn()
+            end.record()
+            sync(device)
+            times.append(start.elapsed_time(end) / 1000.0)
+    else:
+        for _ in range(runs):
+            sync(device)
+            t0 = time.perf_counter()
+            fn()
+            sync(device)
+            times.append(time.perf_counter() - t0)
     return min(times), sum(times) / len(times), times
 
 
 def tflops(flops: float, seconds: float) -> float:
-    if seconds <= 0:
-        return 0.0
-    return flops / seconds / 1e12
+    return 0.0 if seconds <= 0 else flops / seconds / 1e12
+
+
+def gbs(nbytes: float, seconds: float) -> float:
+    return 0.0 if seconds <= 0 else nbytes / seconds / 1e9
 
 
 def parse_dtype(name: str) -> torch.dtype:
@@ -327,10 +343,10 @@ def dtype_supported(device: torch.device, dtype: torch.dtype) -> bool:
     if dtype == torch.float32:
         return True
     if device.type == "cpu":
-        return dtype == torch.bfloat16  # fp16 CPU matmul is often missing/slow-path
+        return dtype == torch.bfloat16
     if device.type == "mps":
         return dtype in (torch.float16, torch.bfloat16)
-    return True  # CUDA / XPU
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -338,8 +354,6 @@ def dtype_supported(device: torch.device, dtype: torch.dtype) -> bool:
 # ---------------------------------------------------------------------------
 
 class TinyNet(nn.Module):
-    """Small conv net for a light train/infer smoke test."""
-
     def __init__(self, num_classes: int = 10) -> None:
         super().__init__()
         self.features = nn.Sequential(
@@ -350,17 +364,15 @@ class TinyNet(nn.Module):
             nn.Conv2d(64, 64, 3, padding=1),
             nn.ReLU(inplace=True),
             nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
         )
         self.head = nn.Linear(64, num_classes)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.features(x)
-        x = torch.flatten(x, 1)
-        return self.head(x)
+        return self.head(self.features(x))
 
 
 def conv_flops(batch: int, cin: int, cout: int, h: int, w: int, k: int) -> int:
-    # multiply-add counted as 2 FLOPs
     return 2 * batch * cout * h * w * (k * k * cin)
 
 
@@ -374,31 +386,41 @@ def tiny_forward_flops(batch: int, image: int) -> int:
     )
 
 
+def new_eval_model(device: torch.device, dtype: torch.dtype) -> TinyNet:
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+    return TinyNet().to(device=device, dtype=dtype).eval()
+
+
+def run_steps(model: nn.Module, x: torch.Tensor, steps: int) -> torch.Tensor:
+    with torch.inference_mode():
+        y = x
+        for _ in range(steps):
+            y = model(x)
+        if not torch.isfinite(y.float().sum()):
+            raise RuntimeError("infer produced non-finite values")
+        return y
+
+
 # ---------------------------------------------------------------------------
 # Benchmarks
 # ---------------------------------------------------------------------------
 
-def bench_matmul(
-    device: torch.device,
-    dtype: torch.dtype,
-    n: int,
-    inner: int,
-) -> dict[str, Any]:
+def bench_matmul(device: torch.device, dtype: torch.dtype, n: int, inner: int) -> dict[str, Any]:
     a = torch.randn(n, n, device=device, dtype=dtype)
     b = torch.randn(n, n, device=device, dtype=dtype)
     out = torch.empty(n, n, device=device, dtype=dtype)
 
     def run() -> None:
         nonlocal out
-        for _ in range(inner):
-            out = a @ b
+        with torch.inference_mode():
+            for _ in range(inner):
+                out = a @ b
 
     flops = inner * (2 * n * n * n)
     fastest, avg, times = timed_runs(run, device)
-    # keep a live reference so the last result is not optimized away
     if not torch.isfinite(out.float().sum()):
         raise RuntimeError("matmul produced non-finite values")
-
     return {
         "bench": "matmul",
         "detail": f"{n}x{n} gemm x{inner}",
@@ -412,12 +434,10 @@ def bench_matmul(
 
 
 def bench_train(
-    device: torch.device,
-    dtype: torch.dtype,
-    batch: int,
-    image: int,
-    steps: int,
+    device: torch.device, dtype: torch.dtype, batch: int, image: int, steps: int
 ) -> dict[str, Any]:
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
     model = TinyNet().to(device=device, dtype=dtype)
     model.train()
     opt = torch.optim.SGD(model.parameters(), lr=0.01)
@@ -428,12 +448,10 @@ def bench_train(
     def run() -> None:
         for _ in range(steps):
             opt.zero_grad(set_to_none=True)
-            logits = model(x)
-            loss = loss_fn(logits, y)
+            loss = loss_fn(model(x), y)
             loss.backward()
             opt.step()
 
-    # ~1x forward + ~2x backward
     flops = steps * 3 * tiny_forward_flops(batch, image)
     fastest, avg, times = timed_runs(run, device)
     return {
@@ -450,26 +468,12 @@ def bench_train(
 
 
 def bench_infer(
-    device: torch.device,
-    dtype: torch.dtype,
-    batch: int,
-    image: int,
-    steps: int,
+    device: torch.device, dtype: torch.dtype, batch: int, image: int, steps: int
 ) -> dict[str, Any]:
-    model = TinyNet().to(device=device, dtype=dtype)
-    model.eval()
+    model = new_eval_model(device, dtype)
     x = torch.randn(batch, 3, image, image, device=device, dtype=dtype)
-
-    def run() -> None:
-        with torch.no_grad():
-            y = x
-            for _ in range(steps):
-                y = model(x)
-            if not torch.isfinite(y.float().sum()):
-                raise RuntimeError("infer produced non-finite values")
-
+    fastest, avg, times = timed_runs(lambda: run_steps(model, x, steps), device)
     flops = steps * tiny_forward_flops(batch, image)
-    fastest, avg, times = timed_runs(run, device)
     return {
         "bench": "infer",
         "detail": f"TinyNet {batch}x3x{image}x{image}, {steps} fwd",
@@ -482,11 +486,168 @@ def bench_infer(
     }
 
 
-BENCH_FNS = {
-    "matmul": bench_matmul,
-    "train": bench_train,
-    "infer": bench_infer,
-}
+def _host_tensor(n: int, device: torch.device) -> torch.Tensor:
+    pin = device.type == "cuda"
+    try:
+        return torch.empty(n, dtype=torch.float32, pin_memory=pin)
+    except Exception:
+        return torch.empty(n, dtype=torch.float32)
+
+
+def bench_bandwidth(device: torch.device, size_mb: int, inner: int) -> dict[str, Any]:
+    nbytes = max(1, size_mb) * 1024 * 1024
+    n = nbytes // 4
+    nbytes = n * 4
+    non_blocking = device.type in ("cuda", "xpu")
+
+    src = torch.empty(n, device=device, dtype=torch.float32)
+    dst = torch.empty_like(src)
+    src.fill_(1)
+    copies = {"d2d": (src, dst)}
+    if device.type != "cpu":
+        host = _host_tensor(n, device)
+        host.fill_(1)
+        copies["h2d"] = (host, dst)
+        copies["d2h"] = (src, host)
+
+    metrics: dict[str, Any] = {}
+    for name, (a, b) in copies.items():
+        def run(a=a, b=b) -> None:
+            for _ in range(inner):
+                b.copy_(a, non_blocking=non_blocking)
+
+        fastest, avg, times = timed_runs(run, device)
+        moved = nbytes * inner
+        metrics[name] = {
+            "fastest_s": fastest,
+            "average_s": avg,
+            "times_s": times,
+            "gbs_best": gbs(moved, fastest),
+            "gbs_avg": gbs(moved, avg),
+        }
+
+    return {
+        "bench": "bandwidth",
+        "detail": f"{size_mb} MiB x{inner} copies, float32",
+        "bytes": nbytes,
+        "inner": inner,
+        "copies": metrics,
+        "fastest_s": metrics["d2d"]["fastest_s"],
+        "average_s": metrics["d2d"]["average_s"],
+        "gbs_best": metrics["d2d"]["gbs_best"],
+        "gbs_avg": metrics["d2d"]["gbs_avg"],
+    }
+
+
+def dynamo_reset() -> None:
+    dynamo = getattr(torch, "_dynamo", None)
+    if dynamo is not None and hasattr(dynamo, "reset"):
+        dynamo.reset()
+
+
+def bench_compile(
+    device: torch.device,
+    dtype: torch.dtype,
+    batch: int,
+    image: int,
+    steps: int,
+    mode: str,
+) -> dict[str, Any]:
+    if not hasattr(torch, "compile"):
+        raise RuntimeError("torch.compile requires PyTorch 2.0+")
+
+    example = torch.randn(batch, 3, image, image, device=device, dtype=dtype)
+    eager = new_eval_model(device, dtype)
+    eager_fastest, eager_avg, eager_times = timed_runs(
+        lambda: run_steps(eager, example, steps), device
+    )
+
+    model = new_eval_model(device, dtype)
+    with COMPILE_LOCK:
+        dynamo_reset()
+        compiled = torch.compile(model, mode=mode)
+        t0 = time.perf_counter()
+        run_steps(compiled, example, 1)
+        sync(device)
+        compile_s = time.perf_counter() - t0
+
+    # extra warmup: reduce-overhead may capture CUDA graphs after the first run
+    fastest, avg, times = timed_runs(
+        lambda: run_steps(compiled, example, steps), device, warmup=2, runs=3
+    )
+    flops = steps * tiny_forward_flops(batch, image)
+    speedup = (eager_fastest / fastest) if fastest > 0 else 0.0
+    return {
+        "bench": "compile",
+        "mode": mode,
+        "detail": f"torch.compile({mode}) TinyNet {batch}x3x{image}x{image}, {steps} fwd",
+        "compile_s": compile_s,
+        "flops": flops,
+        "fastest_s": fastest,
+        "average_s": avg,
+        "times_s": times,
+        "tflops_best": tflops(flops, fastest),
+        "tflops_avg": tflops(flops, avg),
+        "eager_fastest_s": eager_fastest,
+        "eager_average_s": eager_avg,
+        "eager_times_s": eager_times,
+        "eager_tflops_best": tflops(flops, eager_fastest),
+        "speedup_best": speedup,
+    }
+
+
+def bench_export(
+    device: torch.device,
+    dtype: torch.dtype,
+    batch: int,
+    image: int,
+    steps: int,
+) -> dict[str, Any]:
+    try:
+        from torch.export import export as torch_export
+    except ImportError as e:
+        raise RuntimeError("torch.export requires PyTorch 2.1+") from e
+
+    example = torch.randn(batch, 3, image, image, device=device, dtype=dtype)
+    eager = new_eval_model(device, dtype)
+    eager_fastest, eager_avg, eager_times = timed_runs(
+        lambda: run_steps(eager, example, steps), device
+    )
+
+    model = new_eval_model(device, dtype)
+    with COMPILE_LOCK:
+        t0 = time.perf_counter()
+        try:
+            exported = torch_export(model, (example,))
+        except Exception:
+            exported = torch_export(model, (example,), strict=False)
+        compile_s = time.perf_counter() - t0
+        run_mod = exported.module()
+        run_steps(run_mod, example, 1)
+        sync(device)
+
+    fastest, avg, times = timed_runs(
+        lambda: run_steps(run_mod, example, steps), device, warmup=2, runs=3
+    )
+    flops = steps * tiny_forward_flops(batch, image)
+    speedup = (eager_fastest / fastest) if fastest > 0 else 0.0
+    return {
+        "bench": "export",
+        "mode": "export",
+        "detail": f"torch.export TinyNet {batch}x3x{image}x{image}, {steps} fwd",
+        "compile_s": compile_s,
+        "flops": flops,
+        "fastest_s": fastest,
+        "average_s": avg,
+        "times_s": times,
+        "tflops_best": tflops(flops, fastest),
+        "tflops_avg": tflops(flops, avg),
+        "eager_fastest_s": eager_fastest,
+        "eager_average_s": eager_avg,
+        "eager_times_s": eager_times,
+        "eager_tflops_best": tflops(flops, eager_fastest),
+        "speedup_best": speedup,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -500,7 +661,6 @@ def collect_system() -> dict[str, Any]:
             cudnn = torch.backends.cudnn.version()
     except Exception:
         pass
-
     return {
         "python": platform.python_version(),
         "platform": f"{platform.system()} {platform.release()} ({platform.machine()})",
@@ -516,10 +676,10 @@ def collect_system() -> dict[str, Any]:
 
 
 def print_header(sysinfo: dict[str, Any], devices: list[torch.device]) -> None:
-    print(c("bold", c("cyan", "PyTorch device probe + light benchmark")))
-    print(c("dim", "1 warmup + 3 runs  →  fastest + average  →  estimated TFLOPS"))
-    print()
-    print(c("bold", "System"))
+    log(c("bold", c("cyan", "PyTorch device probe + light benchmark")))
+    log(c("dim", "1 warmup + 3 runs  →  fastest + average  |  multi-GPU in parallel"))
+    log()
+    log(c("bold", "System"))
     rows = [
         ("Python", sysinfo["python"]),
         ("OS", sysinfo["platform"]),
@@ -534,37 +694,62 @@ def print_header(sysinfo: dict[str, Any], devices: list[torch.device]) -> None:
     ]
     width = max(len(k) for k, _ in rows)
     for k, v in rows:
-        print(f"  {c('dim', k.ljust(width))}  {v}")
+        log(f"  {c('dim', k.ljust(width))}  {v}")
 
-    print()
-    print(c("bold", "Devices"))
+    log()
+    log(c("bold", "Devices"))
     for d in devices:
         vram = device_vram(d)
         extra = extra_device_info(d)
         cap = f"  cc {extra['capability']}" if extra.get("capability") else ""
-        mem = f"  VRAM {fmt_bytes(vram)}" if vram is not None else ""
-        if d.type == "mps":
-            mem = f"  unified {fmt_bytes(vram)}"
         if d.type == "cpu":
             mem = f"  RAM {fmt_bytes(ram_bytes())}"
-        print(f"  {c('yellow', str(d)):<22} {device_name(d)}{cap}{mem}")
-    print()
+        elif d.type == "mps":
+            mem = f"  unified {fmt_bytes(vram)}"
+        else:
+            mem = f"  VRAM {fmt_bytes(vram)}" if vram is not None else ""
+        log(f"  {c('yellow', str(d)):<22} {device_name(d)}{cap}{mem}")
+    log()
 
 
 def print_result(device: torch.device, result: dict[str, Any] | None, err: str | None) -> None:
     tag = f"{device}"
     if err:
-        print(f"  {c('red', 'FAIL')}  {tag:<10} {result and result.get('bench') or '':<8} {err}")
+        name = (result or {}).get("bench", "")
+        mode = (result or {}).get("mode")
+        label = f"{name}/{mode}" if mode else name
+        log(f"  {c('red', 'FAIL')}  {tag:<10} {label:<22} {err}")
         return
     assert result is not None
+    bench = result["bench"]
+    if bench == "bandwidth":
+        parts = []
+        for key, label in (("d2d", "D2D"), ("h2d", "H2D"), ("d2h", "D2H")):
+            block = result.get("copies", {}).get(key)
+            if not block:
+                continue
+            parts.append(f"{label} {block['gbs_best']:7.1f} GB/s")
+        log(
+            f"  {c('green', 'PASS')}  {tag:<10} {'bandwidth':<22} "
+            + "  ".join(parts)
+            + f"  {c('dim', result['detail'])}"
+        )
+        return
     best_ms = result["fastest_s"] * 1000
     avg_ms = result["average_s"] * 1000
-    print(
-        f"  {c('green', 'PASS')}  {tag:<10} {result['bench']:<8} "
+    label = f"{bench}/{result['mode']}" if result.get("mode") else bench
+    extra = ""
+    if bench in ("compile", "export"):
+        extra = (
+            f"  {c('magenta', f'{result['speedup_best']:.2f}x eager')}  "
+            f"compile {result['compile_s']*1000:.0f} ms"
+        )
+    log(
+        f"  {c('green', 'PASS')}  {tag:<10} {label:<22} "
         f"best {c('bold', f'{best_ms:8.2f} ms')}  "
         f"avg {avg_ms:8.2f} ms  "
-        f"{c('cyan', f'{result['tflops_best']:7.2f} TFLOPS')}  "
-        f"{c('dim', result['detail'])}"
+        f"{c('cyan', f'{result['tflops_best']:7.2f} TFLOPS')}"
+        f"{extra}  {c('dim', result['detail'])}"
     )
 
 
@@ -581,42 +766,192 @@ def json_ready(obj: Any) -> Any:
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Runner
 # ---------------------------------------------------------------------------
+
+ALL_BENCHES = ["matmul", "bandwidth", "train", "infer", "compile", "export"]
+COMPILE_MODES = ["default", "reduce-overhead", "max-autotune"]
+
 
 def parse_benches(spec: str) -> list[str]:
     spec = spec.lower().strip()
     if spec == "all":
-        return ["matmul", "train", "infer"]
+        return list(ALL_BENCHES)
     items = [x.strip() for x in spec.split(",") if x.strip()]
-    unknown = [x for x in items if x not in BENCH_FNS]
+    mapped: list[str] = []
+    for x in items:
+        if x == "jit":
+            mapped.append("compile")
+        else:
+            mapped.append(x)
+    unknown = [x for x in mapped if x not in ALL_BENCHES]
     if unknown:
         raise argparse.ArgumentTypeError(
-            f"unknown bench {unknown}; use matmul,train,infer,all"
+            f"unknown bench {unknown}; use {','.join(ALL_BENCHES)},all"
+        )
+    return mapped
+
+
+def parse_compile_modes(spec: str) -> list[str]:
+    spec = spec.lower().strip()
+    if spec in ("all", "both"):
+        return ["default", "reduce-overhead"]
+    items = [x.strip() for x in spec.split(",") if x.strip()]
+    unknown = [x for x in items if x not in COMPILE_MODES]
+    if unknown:
+        raise argparse.ArgumentTypeError(
+            f"unknown compile mode {unknown}; use {','.join(COMPILE_MODES)},all"
         )
     return items
 
 
+def auto_bw_mb(device: torch.device, requested: int) -> int:
+    if requested > 0:
+        return requested
+    vram = device_vram(device)
+    if vram:
+        return max(64, min(1024, int(vram * 0.08 / (1024 * 1024))))
+    return 256 if device.type != "cpu" else 128
+
+
+def run_one_bench(
+    device: torch.device,
+    bench: str,
+    args: argparse.Namespace,
+    dtype: torch.dtype,
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    if bench == "matmul":
+        n = args.size if args.size > 0 else (2048 if device.type == "cpu" else 4096)
+        rows.append(bench_matmul(device, dtype, n, max(1, args.matmul_inner)))
+    elif bench == "train":
+        rows.append(
+            bench_train(device, dtype, args.batch, args.image_size, max(1, args.train_steps))
+        )
+    elif bench == "infer":
+        rows.append(
+            bench_infer(device, dtype, args.batch, args.image_size, max(1, args.infer_steps))
+        )
+    elif bench == "bandwidth":
+        rows.append(
+            bench_bandwidth(device, auto_bw_mb(device, args.bw_mb), max(1, args.bw_inner))
+        )
+    elif bench == "compile":
+        for mode in parse_compile_modes(args.compile_mode):
+            rows.append(
+                bench_compile(
+                    device, dtype, args.batch, args.image_size, max(1, args.infer_steps), mode
+                )
+            )
+    elif bench == "export":
+        rows.append(
+            bench_export(device, dtype, args.batch, args.image_size, max(1, args.infer_steps))
+        )
+    else:
+        raise ValueError(bench)
+    return rows
+
+
+def run_device(
+    device: torch.device,
+    benches: list[str],
+    args: argparse.Namespace,
+    dtype: torch.dtype,
+) -> list[dict[str, Any]]:
+    report: list[dict[str, Any]] = []
+    with on_device(device):
+        use_dtype = dtype if dtype_supported(device, dtype) else torch.float32
+        if use_dtype != dtype:
+            log(c("yellow", "SKIP") + f"  {device} {args.dtype} unsupported; using float32")
+
+        for bench in benches:
+            meta = {
+                "device": str(device),
+                "device_name": device_name(device),
+                "vram": device_vram(device),
+                "dtype": str(use_dtype).replace("torch.", ""),
+            }
+            try:
+                for result in run_one_bench(device, bench, args, use_dtype):
+                    print_result(device, result, None)
+                    report.append({**meta, **result, "ok": True})
+            except Exception as e:
+                stub = {"bench": bench}
+                print_result(device, stub, f"{type(e).__name__}: {e}")
+                report.append({**meta, "bench": bench, "ok": False, "error": str(e)})
+            finally:
+                empty_cache(device)
+    return report
+
+
+def group_devices(devices: list[torch.device]) -> list[list[torch.device]]:
+    cuda = [d for d in devices if d.type == "cuda"]
+    xpu = [d for d in devices if d.type == "xpu"]
+    rest = [d for d in devices if d.type not in ("cuda", "xpu", "cpu")]
+    cpu = [d for d in devices if d.type == "cpu"]
+    groups: list[list[torch.device]] = []
+    if cuda:
+        groups.append(cuda)
+    if xpu:
+        groups.append(xpu)
+    for d in rest:
+        groups.append([d])
+    if cpu:
+        groups.append(cpu)
+    return groups
+
+
+def run_group(
+    group: list[torch.device],
+    benches: list[str],
+    args: argparse.Namespace,
+    dtype: torch.dtype,
+    parallel: bool,
+) -> list[dict[str, Any]]:
+    if len(group) == 1 or not parallel:
+        out: list[dict[str, Any]] = []
+        for d in group:
+            out.extend(run_device(d, benches, args, dtype))
+        return out
+
+    jobs = len(group) if args.jobs <= 0 else max(1, min(args.jobs, len(group)))
+    log(
+        c("dim", f"Running {len(group)} devices in parallel (jobs={jobs}): ")
+        + ", ".join(str(d) for d in group)
+    )
+    out: list[dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=jobs, thread_name_prefix="pt-bench") as pool:
+        futs = [pool.submit(run_device, d, benches, args, dtype) for d in group]
+        for fut in as_completed(futs):
+            out.extend(fut.result())
+    return out
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description="Probe PyTorch devices and run a light benchmark")
-    p.add_argument(
-        "--device",
-        default="all",
-        help="all | auto | cuda | mps | xpu | cpu | cuda:0 (default: all)",
-    )
+    p.add_argument("--device", default="all", help="all | auto | cuda | mps | xpu | cpu | cuda:0")
     p.add_argument(
         "--bench",
         default="all",
-        help="all | comma list: matmul,train,infer (default: all)",
+        help="all | comma list: matmul,bandwidth,train,infer,compile,export",
     )
-    p.add_argument("--size", type=int, default=0, help="matmul N for NxN (0 = auto: 4096 accel / 2048 CPU)")
-    p.add_argument("--batch", type=int, default=32, help="train/infer batch size")
-    p.add_argument("--image-size", type=int, default=64, help="train/infer spatial size")
-    p.add_argument("--train-steps", type=int, default=10, help="optimizer steps per timed run")
-    p.add_argument("--infer-steps", type=int, default=20, help="forward passes per timed run")
-    p.add_argument("--matmul-inner", type=int, default=1, help="gemm repeats per timed run")
+    p.add_argument("--size", type=int, default=0, help="matmul N (0=auto)")
+    p.add_argument("--batch", type=int, default=32)
+    p.add_argument("--image-size", type=int, default=64)
+    p.add_argument("--train-steps", type=int, default=10)
+    p.add_argument("--infer-steps", type=int, default=20)
+    p.add_argument("--matmul-inner", type=int, default=1)
+    p.add_argument("--bw-mb", type=int, default=0, help="copy size in MiB (0=auto ~8% VRAM)")
+    p.add_argument("--bw-inner", type=int, default=20, help="copies per timed bandwidth run")
+    p.add_argument(
+        "--compile-mode",
+        default="default,reduce-overhead",
+        help="default | reduce-overhead | max-autotune | all (all = first two)",
+    )
     p.add_argument("--dtype", default="float32", help="float32 | float16 | bfloat16")
-    p.add_argument("--json", nargs="?", const="pytorch_bench.json", help="write JSON report")
+    p.add_argument("--jobs", type=int, default=0, help="parallel GPU workers (0=one per GPU)")
+    p.add_argument("--sequential", action="store_true", help="disable multi-GPU parallel")
+    p.add_argument("--json", nargs="?", const="pytorch_bench.json")
     p.add_argument("--no-color", action="store_true")
     args = p.parse_args()
 
@@ -628,68 +963,43 @@ def main() -> int:
     try:
         benches = parse_benches(args.bench)
         dtype = parse_dtype(args.dtype)
+        parse_compile_modes(args.compile_mode)
     except argparse.ArgumentTypeError as e:
         p.error(str(e))
 
     all_devs = discover_devices()
     devices = filter_devices(all_devs, args.device)
     if not devices:
-        print(c("red", f"No devices matched --device {args.device}"))
-        print("Available:", ", ".join(str(d) for d in all_devs) or "(none)")
+        log(c("red", f"No devices matched --device {args.device}"))
+        log("Available: " + (", ".join(str(d) for d in all_devs) or "(none)"))
         return 2
 
     sysinfo = collect_system()
     print_header(sysinfo, all_devs)
     if args.device != "all":
-        print(c("dim", f"Running on: {', '.join(str(d) for d in devices)}"))
-        print()
+        log(c("dim", "Running on: " + ", ".join(str(d) for d in devices)))
+        log()
 
-    print(c("bold", "Benchmark") + c("dim", f"  dtype={str(dtype).replace('torch.', '')}  benches={','.join(benches)}"))
+    parallel = not args.sequential
+    log(
+        c("bold", "Benchmark")
+        + c(
+            "dim",
+            f"  dtype={str(dtype).replace('torch.', '')}  benches={','.join(benches)}"
+            f"  parallel={'on' if parallel else 'off'}  compile={args.compile_mode}",
+        )
+    )
+
     report: list[dict[str, Any]] = []
-    failures = 0
+    for group in group_devices(devices):
+        report.extend(run_group(group, benches, args, dtype, parallel))
 
-    for device in devices:
-        use_dtype = dtype
-        if not dtype_supported(device, dtype):
-            print(
-                c("yellow", "SKIP")
-                + f"  {device} does not support {args.dtype} well; using float32"
-            )
-            use_dtype = torch.float32
-
-        for bench in benches:
-            meta = {
-                "device": str(device),
-                "device_name": device_name(device),
-                "vram": device_vram(device),
-                "dtype": str(use_dtype).replace("torch.", ""),
-            }
-            try:
-                if bench == "matmul":
-                    n = args.size if args.size > 0 else (2048 if device.type == "cpu" else 4096)
-                    result = bench_matmul(device, use_dtype, n, max(1, args.matmul_inner))
-                elif bench == "train":
-                    result = bench_train(
-                        device, use_dtype, args.batch, args.image_size, max(1, args.train_steps)
-                    )
-                else:
-                    result = bench_infer(
-                        device, use_dtype, args.batch, args.image_size, max(1, args.infer_steps)
-                    )
-                print_result(device, result, None)
-                report.append({**meta, **result, "ok": True})
-            except Exception as e:
-                failures += 1
-                print_result(device, {"bench": bench}, f"{type(e).__name__}: {e}")
-                report.append({**meta, "bench": bench, "ok": False, "error": str(e)})
-            finally:
-                empty_cache(device)
-
-    print()
+    failures = sum(1 for r in report if not r.get("ok", False))
+    log()
     if failures:
-        print(c("yellow", f"Done with {failures} failure(s)."))
+        log(c("yellow", f"Done with {failures} failure(s)."))
     else:
-        print(c("green", "All selected benches passed."))
+        log(c("green", "All selected benches passed."))
 
     if args.json:
         payload = {
@@ -707,7 +1017,7 @@ def main() -> int:
         }
         with open(args.json, "w", encoding="utf-8") as f:
             json.dump(json_ready(payload), f, indent=2)
-        print(c("dim", f"Wrote {args.json}"))
+        log(c("dim", f"Wrote {args.json}"))
 
     return 1 if failures else 0
 
